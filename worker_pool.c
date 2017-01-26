@@ -24,10 +24,10 @@ typedef struct worker_channel_st {
  * A queue for placing the worker channel when the worker is 
  * ready to serve.
  */
-typedef struct worker_channel_queue_st {
+typedef struct worker_pool_queue_st {
     worker_channel_t *channel;
-    struct worker_channel_queue_st *next;
-} worker_channel_queue_t, worker_channel_queue_element_t;
+    struct worker_pool_queue_st *next;
+} worker_pool_queue_t, worker_pool_queue_element_t;
 
 /**
  * A queue for storing the job until a worker channel becomes available.
@@ -64,7 +64,7 @@ typedef struct dispatcher_st {
     pthread_cond_t cond;
 
     struct worker_st **workers;
-    worker_channel_queue_t *channel_root;
+    worker_pool_queue_t *ready_channel_root;
     job_queue_t *job_root;
     int num_workers;
     int job_pending_cnt;
@@ -107,19 +107,19 @@ new_dispatcher(int num_workers) {
 }
 
 /**
- * func: new_worker_channel_element
+ * func: new_worker_pool_queue_element
  *
  * wraps the worker channel pointer into a worker_channel_queue element which
  * can then be added into a worker_channel_queue list.
  *
  * arg1: worker_channel_t *
  */
-worker_channel_queue_t *
-new_worker_channel_element(worker_channel_t *channel) {
-    worker_channel_queue_element_t *node =
-            (worker_channel_queue_element_t *) malloc(
-                    sizeof(worker_channel_queue_element_t));
-    memset(node, 0, sizeof(worker_channel_queue_element_t));
+worker_pool_queue_t *
+new_worker_pool_queue_element(worker_channel_t *channel) {
+    worker_pool_queue_element_t *node =
+            (worker_pool_queue_element_t *) malloc(
+                    sizeof(worker_pool_queue_element_t));
+    memset(node, 0, sizeof(worker_pool_queue_element_t));
     node->channel = channel;
     return node;
 }
@@ -129,15 +129,15 @@ new_worker_channel_element(worker_channel_t *channel) {
  *
  * Add's the worker channel into a worker channel queue
  * 
- * arg1: worker_channel_queue_t **root
+ * arg1: worker_pool_queue_t **root
  * arg2: worker_channel_t *channel
  */
-void add_channel(worker_channel_queue_t **root, worker_channel_t *channel) {
-    worker_channel_queue_element_t *prev;
+void add_channel(worker_pool_queue_t **root, worker_channel_t *channel) {
+    worker_pool_queue_element_t *prev;
 
     if (root == NULL)
         return;
-    worker_channel_queue_element_t *node = new_worker_channel_element(channel);
+    worker_pool_queue_element_t *node = new_worker_pool_queue_element(channel);
 
     if (node != NULL) {
         if (*root == NULL) {
@@ -158,11 +158,11 @@ void add_channel(worker_channel_queue_t **root, worker_channel_t *channel) {
  *
  * Remove's the matching worker channel from the worker channel queue
  * 
- * arg1: worker_channel_queue_t **root
+ * arg1: worker_pool_queue_t **root
  * arg2: worker_channel_t *channel
  */
-void remove_channel(worker_channel_queue_t **root, worker_channel_t *channel) {
-    worker_channel_queue_element_t *prev = NULL, *cur = NULL;
+void remove_channel(worker_pool_queue_t **root, worker_channel_t *channel) {
+    worker_pool_queue_element_t *prev = NULL, *cur = NULL;
 
     if (root == NULL || *root == NULL)
         return;
@@ -269,17 +269,20 @@ worker_t *new_worker(dispatcher_t *d, int num) {
 }
 
 /**
- * worker_add_channel
+ * worker_signal_channel_ready
+ *
+ * Adds the worker channel into the dispatchers queue
+ * of available workers
  *
  */
-void worker_add_channel(dispatcher_t *d, worker_channel_t *worker_channel)
-{
+void worker_signal_channel_ready(dispatcher_t *d, 
+                    worker_channel_t *worker_channel) {
     pthread_mutex_lock(&d->lock);
     if (d->stop) {
         pthread_mutex_unlock(&d->lock);
         return;
     }
-    add_channel(&d->channel_root, worker_channel);
+    add_channel(&d->ready_channel_root, worker_channel);
     if (d->dispatcher_thread_waiting) {
         pthread_cond_signal(&d->cond);
     }
@@ -301,7 +304,7 @@ void* worker_thread_start(void *arg) {
     worker_t *worker = (worker_t *) arg;
     for (;;) {
         pthread_mutex_lock(&worker->channel.lock);
-        worker_add_channel(worker->dispatcher, &worker->channel);
+        worker_signal_channel_ready(worker->dispatcher, &worker->channel);
         if (worker->stop) {
             pthread_mutex_unlock(&worker->channel.lock);
             break;
@@ -359,11 +362,25 @@ void worker_pool_start(dispatcher_t *d) {
     }
 }
 
+/**
+ * worker_pool_stop
+ *
+ * Called to clear all jobs and stop all
+ * the workers
+ */
 void worker_pool_stop(dispatcher_t *d) {
 
     pthread_mutex_lock(&d->lock);
     d->stop = 1;
-    d->job_pending_cnt = 0;
+    while (1) {
+        job_queue_t *cur = d->job_root;
+        if (cur == NULL) {
+            break;
+        }
+        d->job_pending_cnt--;
+        remove_job(&d->job_root, cur->job);
+        free(cur);
+    }
     pthread_mutex_unlock(&d->lock);
 
     for (int i = 0; i < d->num_workers; i++) {
@@ -387,9 +404,9 @@ void worker_pool_stop(dispatcher_t *d) {
  * arg2: job_t *
  */
 short dispatch_job(dispatcher_t *d, job_t *job) {
-    worker_channel_queue_t *worker_channel_top;
+    worker_pool_queue_t *worker_channel_top;
     pthread_mutex_lock(&d->lock);
-    worker_channel_top = d->channel_root;
+    worker_channel_top = d->ready_channel_root;
     if (worker_channel_top == NULL) { // no free worker channels
         d->job_pending_cnt++;
         add_job(&d->job_root, job); // queue up the job
@@ -397,7 +414,7 @@ short dispatch_job(dispatcher_t *d, job_t *job) {
         return 0;
     }
 
-    remove_channel(&d->channel_root, worker_channel_top->channel);
+    remove_channel(&d->ready_channel_root, worker_channel_top->channel);
     pthread_mutex_unlock(&d->lock);
 
     worker_channel_top->channel->job = job;
@@ -408,6 +425,45 @@ short dispatch_job(dispatcher_t *d, job_t *job) {
     return 1;
 }
 
+/**
+ * func: dispatch_all_pending_jobs
+ *
+ * internal function to dispatch all jobs in job queue to available
+ * workers. Break out of the loop if a worker is not available,
+ * or dispatcher is stopped or when no more pending jobs found.
+ *
+ */
+void dispatch_all_pending_jobs(dispatcher_t *d) {
+    while (1) {
+        pthread_mutex_lock(&d->lock);
+        job_queue_t *cur = d->job_root;
+        if (cur == NULL) {
+            pthread_mutex_unlock(&d->lock);
+            break;
+        }
+ 
+        if (d->stop) {
+            pthread_mutex_unlock(&d->lock);
+            break; 
+        }
+ 
+        if (d->ready_channel_root == NULL) {
+            pthread_mutex_unlock(&d->lock);
+            break;
+        }
+ 
+        d->job_pending_cnt--;
+        remove_job(&d->job_root, cur->job);
+        pthread_mutex_unlock(&d->lock);
+ 
+        if (!dispatch_job(d, cur->job)) {
+            free(cur);
+            break;
+        }
+        free(cur);
+    }
+}
+  
 /**
  * func: dispatch_thread_start
  *
@@ -423,7 +479,7 @@ void* dispatch_thread_start(void *arg) {
             break; // exit the thread
         }
 
-        if (d->job_pending_cnt == 0 || d->channel_root == NULL) {
+        if (d->job_pending_cnt == 0 || d->ready_channel_root == NULL) {
             d->dispatcher_thread_waiting = 1;
             pthread_cond_wait(&d->cond, &d->lock);
             d->dispatcher_thread_waiting = 0;
@@ -433,36 +489,14 @@ void* dispatch_thread_start(void *arg) {
                 break; // exit the thread
             }
 
-            if (d->job_pending_cnt == 0 || d->channel_root == NULL) {
+            if (d->job_pending_cnt == 0 || d->ready_channel_root == NULL) {
                 pthread_mutex_unlock(&d->lock);
                 continue;
             }
         }
         pthread_mutex_unlock(&d->lock);
+        dispatch_all_pending_jobs(d);
 
-        while (1) {
-            pthread_mutex_lock(&d->lock);
-            job_queue_t *cur = d->job_root;
-            if (cur == NULL) {
-                pthread_mutex_unlock(&d->lock);
-                break;
-            }
-
-            if (d->stop) {
-                pthread_mutex_unlock(&d->lock);
-                break; // exit the thread
-            }
-
-            d->job_pending_cnt--;
-            remove_job(&d->job_root, cur->job);
-            pthread_mutex_unlock(&d->lock);
-
-            if (!dispatch_job(d, cur->job)) {
-                free(cur);
-                break;
-            }
-            free(cur);
-        }
     }
     return NULL;
 }
