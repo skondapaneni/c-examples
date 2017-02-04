@@ -11,8 +11,9 @@ const int MAX_WORKERS = 5;
 typedef void * job_t;
 
 /**
- * A channel struct For each worker to
- * signal when job is available.
+ * A channel struct in each worker.
+ * Dispatcher signal's the cond variable in this channel 
+ * for worker to pickup a job 
  */
 typedef struct worker_channel_st {
     pthread_mutex_t lock;
@@ -21,8 +22,8 @@ typedef struct worker_channel_st {
 } worker_channel_t;
 
 /**
- * A queue for placing the worker channel when the worker is 
- * ready to serve.
+ * A worker pool queue for tracking all the available worker channel's 
+ * A worker add's it channel into this queue when it is free
  */
 typedef struct worker_pool_queue_st {
     worker_channel_t *channel;
@@ -30,7 +31,8 @@ typedef struct worker_pool_queue_st {
 } worker_pool_queue_t, worker_pool_queue_element_t;
 
 /**
- * A queue for storing the job until a worker channel becomes available.
+ * A queue for storing the job temporarily,
+ * until a worker channel becomes available.
  */
 typedef struct job_queue_element_st {
     job_t *job;
@@ -64,7 +66,7 @@ typedef struct dispatcher_st {
     pthread_cond_t cond;
 
     struct worker_st **workers;
-    worker_pool_queue_t *ready_channel_root;
+    worker_pool_queue_t *worker_pool_root;
     job_queue_t *job_root;
     int num_workers;
     int job_pending_cnt;
@@ -75,36 +77,6 @@ typedef struct dispatcher_st {
 
 void* dispatch_thread_start(void *arg);
 
-/**
- * func: new_dispatcher 
- *    Creates a new dispatcher instance initialized with the num workers
- * under service for this dispatcher. Also creates a thread to dispatch job to
- * workers asynchronously.
- * 
- * arg1: num_workers
- */
-dispatcher_t *
-new_dispatcher(int num_workers) {
-    pthread_attr_t attr;
-    int s;
-
-    s = pthread_attr_init(&attr);
-
-    if (s != 0) {
-        perror("pthread_attr_init");
-    }
-
-    dispatcher_t *d = (dispatcher_t *) malloc(sizeof(dispatcher_t));
-    memset(d, 0, sizeof(dispatcher_t));
-
-    d->num_workers = num_workers;
-    d->lock = lock; // initialize
-    d->cond = cond; // initialize
-
-    // A thread for checking if a worker becomes available.
-    s = pthread_create(&d->thread_id, &attr, &dispatch_thread_start, d);
-    return d;
-}
 
 /**
  * func: new_worker_pool_queue_element
@@ -114,7 +86,7 @@ new_dispatcher(int num_workers) {
  *
  * arg1: worker_channel_t *
  */
-worker_pool_queue_t *
+worker_pool_queue_element_t *
 new_worker_pool_queue_element(worker_channel_t *channel) {
     worker_pool_queue_element_t *node =
             (worker_pool_queue_element_t *) malloc(
@@ -125,18 +97,20 @@ new_worker_pool_queue_element(worker_channel_t *channel) {
 }
 
 /**
- * func: add_channel
+ * func: add_worker_channel
  *
  * Add's the worker channel into a worker channel queue
  * 
  * arg1: worker_pool_queue_t **root
  * arg2: worker_channel_t *channel
  */
-void add_channel(worker_pool_queue_t **root, worker_channel_t *channel) {
+void add_worker_channel(worker_pool_queue_t **root, worker_channel_t *channel) {
     worker_pool_queue_element_t *prev;
 
-    if (root == NULL)
+    if (root == NULL) {
         return;
+    }
+
     worker_pool_queue_element_t *node = new_worker_pool_queue_element(channel);
 
     if (node != NULL) {
@@ -154,18 +128,19 @@ void add_channel(worker_pool_queue_t **root, worker_channel_t *channel) {
 }
 
 /**
- * func: remove_channel
+ * func: remove_worker_channel
  *
  * Remove's the matching worker channel from the worker channel queue
  * 
  * arg1: worker_pool_queue_t **root
  * arg2: worker_channel_t *channel
  */
-void remove_channel(worker_pool_queue_t **root, worker_channel_t *channel) {
+void remove_worker_channel(worker_pool_queue_t **root, worker_channel_t *channel) {
     worker_pool_queue_element_t *prev = NULL, *cur = NULL;
 
-    if (root == NULL || *root == NULL)
+    if (root == NULL || *root == NULL) {
         return;
+    }
     for (cur = *root; cur != NULL; cur = cur->next) {
         if (cur->channel == channel) {
             if (cur == *root) {
@@ -282,7 +257,7 @@ void worker_signal_channel_ready(dispatcher_t *d,
         pthread_mutex_unlock(&d->lock);
         return;
     }
-    add_channel(&d->ready_channel_root, worker_channel);
+    add_worker_channel(&d->worker_pool_root, worker_channel);
     if (d->dispatcher_thread_waiting) {
         pthread_cond_signal(&d->cond);
     }
@@ -406,7 +381,7 @@ void worker_pool_stop(dispatcher_t *d) {
 short dispatch_job(dispatcher_t *d, job_t *job) {
     worker_pool_queue_t *worker_channel_top;
     pthread_mutex_lock(&d->lock);
-    worker_channel_top = d->ready_channel_root;
+    worker_channel_top = d->worker_pool_root;
     if (worker_channel_top == NULL) { // no free worker channels
         d->job_pending_cnt++;
         add_job(&d->job_root, job); // queue up the job
@@ -414,7 +389,7 @@ short dispatch_job(dispatcher_t *d, job_t *job) {
         return 0;
     }
 
-    remove_channel(&d->ready_channel_root, worker_channel_top->channel);
+    remove_worker_channel(&d->worker_pool_root, worker_channel_top->channel);
     pthread_mutex_unlock(&d->lock);
 
     worker_channel_top->channel->job = job;
@@ -447,7 +422,7 @@ void dispatch_all_pending_jobs(dispatcher_t *d) {
             break; 
         }
  
-        if (d->ready_channel_root == NULL) {
+        if (d->worker_pool_root == NULL) {
             pthread_mutex_unlock(&d->lock);
             break;
         }
@@ -479,7 +454,7 @@ void* dispatch_thread_start(void *arg) {
             break; // exit the thread
         }
 
-        if (d->job_pending_cnt == 0 || d->ready_channel_root == NULL) {
+        if (d->job_pending_cnt == 0 || d->worker_pool_root == NULL) {
             d->dispatcher_thread_waiting = 1;
             pthread_cond_wait(&d->cond, &d->lock);
             d->dispatcher_thread_waiting = 0;
@@ -489,7 +464,7 @@ void* dispatch_thread_start(void *arg) {
                 break; // exit the thread
             }
 
-            if (d->job_pending_cnt == 0 || d->ready_channel_root == NULL) {
+            if (d->job_pending_cnt == 0 || d->worker_pool_root == NULL) {
                 pthread_mutex_unlock(&d->lock);
                 continue;
             }
@@ -499,6 +474,37 @@ void* dispatch_thread_start(void *arg) {
 
     }
     return NULL;
+}
+
+/**
+ * func: new_dispatcher 
+ *    Creates a new dispatcher instance initialized with the num workers
+ * under service for this dispatcher. Also creates a thread to dispatch job to
+ * workers asynchronously.
+ * 
+ * arg1: num_workers
+ */
+dispatcher_t *
+new_dispatcher(int num_workers) {
+    pthread_attr_t attr;
+    int s;
+
+    s = pthread_attr_init(&attr);
+
+    if (s != 0) {
+        perror("pthread_attr_init");
+    }
+
+    dispatcher_t *d = (dispatcher_t *) malloc(sizeof(dispatcher_t));
+    memset(d, 0, sizeof(dispatcher_t));
+
+    d->num_workers = num_workers;
+    d->lock = lock; // initialize
+    d->cond = cond; // initialize
+
+    // A thread for checking if a worker becomes available.
+    s = pthread_create(&d->thread_id, &attr, &dispatch_thread_start, d);
+    return d;
 }
 
 
